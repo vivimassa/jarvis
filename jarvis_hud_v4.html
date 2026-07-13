@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>J.A.R.V.I.S — HUD v4</title>
+
+<!--
+  JARVIS HUD v4
+    + CPU temp / GPU temp readouts (fed from Python — see jarvis_monitor.py)
+    + FPS counter (measured here, in the render loop — no Python needed)
+    + Network up/down with rolling sparkline
+    + RESPONDING state is now green
+  Public API: setState / setLevel / log / telemetry
+-->
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --void:#04070c; --ice:#7ef0ff; --ice-dim:#2b6f80; --ice-deep:#0e2a33;
+    --state:#7ef0ff; --hot:#ff5470;
+    --glow-s:0 0 6px rgba(126,240,255,.55);
+    --glow-m:0 0 14px rgba(126,240,255,.40);
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{
+    height:100%; background:var(--void); color:var(--ice);
+    font-family:'Rajdhani','Roboto Condensed',system-ui,sans-serif;
+    overflow:hidden; cursor:crosshair;
+  }
+  body::before{
+    content:''; position:fixed; inset:0; pointer-events:none;
+    background:
+      radial-gradient(ellipse 70% 60% at 50% 55%, rgba(20,90,110,.20), transparent 70%),
+      radial-gradient(ellipse 40% 40% at 50% 50%, rgba(126,240,255,.05), transparent 70%);
+  }
+  .grain{
+    position:fixed; inset:0; pointer-events:none; z-index:90;
+    background:repeating-linear-gradient(0deg, rgba(0,0,0,.22) 0 1px, transparent 1px 3px);
+    mix-blend-mode:multiply; opacity:.5;
+  }
+  .vignette{ position:fixed; inset:0; pointer-events:none; z-index:91; box-shadow:inset 0 0 220px 60px rgba(0,0,0,.85); }
+
+  .hud{
+    position:relative; z-index:10; height:100%;
+    display:grid; grid-template-columns:282px 1fr 340px;
+    grid-template-rows:auto 1fr auto; gap:0 28px; padding:22px 30px 26px;
+  }
+  header{ grid-column:1/-1; display:flex; align-items:baseline; justify-content:space-between; }
+  .wordmark{ font-weight:700; font-size:22px; letter-spacing:.72em; text-shadow:var(--glow-m); padding-left:.72em; }
+  .wordmark span{ color:var(--ice-dim); }
+  .mark{ font-family:'Share Tech Mono',monospace; font-size:11px; letter-spacing:.25em; color:var(--ice-dim); margin-top:4px; }
+  .clock{ text-align:right; font-family:'Share Tech Mono',monospace; }
+  .clock .t{ font-size:26px; letter-spacing:.12em; text-shadow:var(--glow-s); }
+  .clock .d{ font-size:11px; letter-spacing:.22em; color:var(--ice-dim); margin-top:2px; }
+
+  .label{
+    font-family:'Share Tech Mono',monospace; font-size:10px; letter-spacing:.3em;
+    color:var(--ice-dim); display:flex; align-items:center; gap:8px; margin:0 0 12px;
+  }
+  .label::after{ content:''; flex:1; height:1px; background:linear-gradient(90deg,var(--ice-deep),transparent); }
+  .label.sub{ margin-top:18px; }
+
+  .telemetry{ padding-top:24px; display:flex; flex-direction:column; overflow:hidden; }
+  .stat{ margin-bottom:13px; }
+  .stat .row{
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-family:'Share Tech Mono',monospace; font-size:11.5px; letter-spacing:.14em;
+  }
+  .stat .row .k{ color:var(--ice-dim); }
+  .stat .row .v{ color:var(--ice); font-size:14px; }
+  .stat .row .v.warn{ color:var(--hot); text-shadow:0 0 8px rgba(255,84,112,.6); }
+  .stat .row .v.na{ color:var(--ice-deep); }
+  .bar{ margin-top:5px; height:5px; display:flex; gap:2px; }
+  .bar i{ flex:1; background:var(--ice-deep); transition:background .25s, box-shadow .25s; }
+  .bar i.on{ background:var(--ice); box-shadow:0 0 5px rgba(126,240,255,.7); }
+  .bar i.hot{ background:var(--hot); box-shadow:0 0 6px rgba(255,84,112,.8); }
+
+  /* network block */
+  .net{ margin-bottom:12px; }
+  .net .rates{
+    display:flex; justify-content:space-between;
+    font-family:'Share Tech Mono',monospace; font-size:11.5px; letter-spacing:.1em;
+  }
+  .net .rates .down{ color:var(--ice); }
+  .net .rates .up{ color:#8fe3b4; }
+  .net .rates .arrow{ color:var(--ice-dim); margin-right:5px; }
+  #net-spark{ width:100%; height:34px; display:block; margin-top:6px; }
+
+  .foot{
+    margin-top:auto; padding-top:14px;
+    font-family:'Share Tech Mono',monospace; font-size:11px;
+    letter-spacing:.16em; color:var(--ice-dim); line-height:1.9;
+    border-top:1px solid var(--ice-deep);
+  }
+  .foot b{ color:var(--ice); font-weight:400; }
+  .foot .fps{ float:right; }
+  .foot .fps b.low{ color:var(--hot); }
+
+  .stage{ position:relative; display:flex; align-items:center; justify-content:center; }
+  #reactor{ position:absolute; inset:0; width:100%; height:100%; }
+  .state{
+    position:absolute; bottom:5%; display:flex; align-items:center; gap:10px;
+    font-family:'Share Tech Mono',monospace; font-size:12px; letter-spacing:.34em;
+    color:var(--state); text-shadow:0 0 8px var(--state); transition:color .5s, text-shadow .5s;
+  }
+  .state .dot{
+    width:7px; height:7px; border-radius:50%; background:var(--state);
+    box-shadow:0 0 10px var(--state); animation:breathe 2.8s ease-in-out infinite;
+    transition:background .5s, box-shadow .5s;
+  }
+  @keyframes breathe{ 50%{ opacity:.25; transform:scale(.75); } }
+  .stage .bracket{ position:absolute; width:34px; height:34px; border:1px solid var(--ice-dim); opacity:.55; }
+  .stage .bracket.tl{ top:0; left:0; border-right:0; border-bottom:0; }
+  .stage .bracket.tr{ top:0; right:0; border-left:0; border-bottom:0; }
+  .stage .bracket.bl{ bottom:0; left:0; border-right:0; border-top:0; }
+  .stage .bracket.br{ bottom:0; right:0; border-left:0; border-top:0; }
+
+  .side{ display:flex; flex-direction:column; padding-top:24px; min-height:0; }
+  .log{
+    flex:1; min-height:0; overflow-y:auto; font-family:'Share Tech Mono',monospace;
+    font-size:12.5px; line-height:1.75; padding-right:8px;
+    mask-image:linear-gradient(180deg,transparent 0,#000 24px);
+  }
+  .log::-webkit-scrollbar{ width:2px; }
+  .log::-webkit-scrollbar-thumb{ background:var(--ice-deep); }
+  .log .line{ margin-bottom:9px; animation:slidein .32s cubic-bezier(.2,.7,.3,1) both; }
+  @keyframes slidein{ from{ opacity:0; transform:translateX(10px); } }
+  .log .who{ display:block; font-size:9.5px; letter-spacing:.28em; color:var(--ice-dim); margin-bottom:1px; }
+  .log .txt{ color:#cdf6ff; }
+  .log .sys .txt{ color:var(--ice-dim); }
+  .log .jarvis .who{ color:#5cffb0; }
+  .log .jarvis .txt{ color:#a8ffd4; text-shadow:0 0 8px rgba(92,255,176,.25); }
+  .log .alert .who, .log .alert .txt{ color:var(--hot); }
+
+  .command{ grid-column:1/-1; display:flex; align-items:center; gap:14px; padding-top:16px; border-top:1px solid var(--ice-deep); }
+  .command .caret{ font-family:'Share Tech Mono',monospace; color:var(--ice-dim); font-size:13px; letter-spacing:.2em; }
+  .command input{
+    flex:1; background:none; border:0; outline:0; color:var(--ice);
+    font-family:'Share Tech Mono',monospace; font-size:14px; letter-spacing:.08em; padding:6px 0;
+  }
+  .command input::placeholder{ color:var(--ice-dim); opacity:.7; }
+  .command input:focus{ box-shadow:0 1px 0 var(--state); }
+  .esc{
+    font-family:'Share Tech Mono',monospace; font-size:10px; letter-spacing:.24em;
+    color:var(--ice-dim); border:1px solid var(--ice-deep); padding:5px 10px;
+    background:none; cursor:pointer; transition:.2s;
+  }
+  .esc:hover{ color:var(--hot); border-color:var(--hot); }
+
+  header{ animation:up .8s ease .1s both; }
+  .telemetry{ animation:up .8s ease .5s both; }
+  .side{ animation:up .8s ease .7s both; }
+  .command{ animation:up .8s ease .9s both; }
+  @keyframes up{ from{ opacity:0; transform:translateY(8px); } }
+  @media (prefers-reduced-motion:reduce){ *{ animation:none !important; transition:none !important; } }
+
+  .demo{ position:fixed; bottom:14px; right:18px; z-index:99; display:flex; gap:6px; }
+  .demo button{
+    font-family:'Share Tech Mono',monospace; font-size:9px; letter-spacing:.2em;
+    color:var(--ice-dim); background:rgba(4,7,12,.8); border:1px solid var(--ice-deep);
+    padding:5px 8px; cursor:pointer;
+  }
+  .demo button:hover{ color:var(--ice); border-color:var(--ice-dim); }
+</style>
+</head>
+<body>
+
+<div class="hud">
+  <header>
+    <div>
+      <div class="wordmark">J<span>.</span>A<span>.</span>R<span>.</span>V<span>.</span>I<span>.</span>S</div>
+      <div class="mark">MARK XLVIII — ONLINE</div>
+    </div>
+    <div class="clock">
+      <div class="t" id="clock-time">00:00:00</div>
+      <div class="d" id="clock-date">—</div>
+    </div>
+  </header>
+
+  <aside class="telemetry">
+    <div class="label">LOAD</div>
+    <div class="stat" data-stat="cpu"><div class="row"><span class="k">CPU</span><span class="v na">—</span></div><div class="bar"></div></div>
+    <div class="stat" data-stat="mem"><div class="row"><span class="k">MEMORY</span><span class="v na">—</span></div><div class="bar"></div></div>
+    <div class="stat" data-stat="gpu"><div class="row"><span class="k">GPU</span><span class="v na">—</span></div><div class="bar"></div></div>
+
+    <div class="label sub">THERMAL</div>
+    <div class="stat" data-stat="cputemp"><div class="row"><span class="k">CPU CORE</span><span class="v na">—</span></div><div class="bar"></div></div>
+    <div class="stat" data-stat="gputemp"><div class="row"><span class="k">GPU CORE</span><span class="v na">—</span></div><div class="bar"></div></div>
+
+    <div class="label sub">NETWORK</div>
+    <div class="net">
+      <div class="rates">
+        <span class="down"><span class="arrow">▼</span><b id="net-down">—</b></span>
+        <span class="up"><span class="arrow">▲</span><b id="net-up">—</b></span>
+      </div>
+      <canvas id="net-spark"></canvas>
+    </div>
+
+    <div class="foot">
+      <span class="fps">FPS <b id="fps">—</b></span>
+      UPTIME &nbsp;<b id="uptime">00:00</b><br>
+      PROCESS &nbsp;<b id="procs">—</b> &nbsp;&nbsp; HOST &nbsp;<b>WIN</b>
+    </div>
+  </aside>
+
+  <main class="stage">
+    <span class="bracket tl"></span><span class="bracket tr"></span>
+    <span class="bracket bl"></span><span class="bracket br"></span>
+    <canvas id="reactor"></canvas>
+    <div class="state" id="state">
+      <span class="dot"></span><span id="state-text">STANDBY</span>
+    </div>
+  </main>
+
+  <section class="side">
+    <div class="label">TRANSCRIPT</div>
+    <div class="log" id="log"></div>
+  </section>
+
+  <div class="command">
+    <span class="caret">&gt;&gt;</span>
+    <input id="cmd" type="text" placeholder="speak, or type a command" autocomplete="off">
+    <button class="esc" id="interrupt">ESC — INTERRUPT</button>
+  </div>
+</div>
+
+<div class="grain"></div>
+<div class="vignette"></div>
+
+<div class="demo">
+  <button data-demo="idle">idle</button>
+  <button data-demo="listening">listening</button>
+  <button data-demo="thinking">thinking</button>
+  <button data-demo="speaking">speaking</button>
+  <button data-demo="alert">alert</button>
+</div>
+
+<script>
+/* ===================== STATE PALETTES =====================
+   speaking is now GREEN — it's the one state that means "output",
+   so it should not share a hue with listening. cyan = open ear,
+   green = talking back, amber = working, crimson = wrong.        */
+const STATES = {
+  idle:      { ring:[ 58,118,138], core:[110,190,215], bright:0.32, tempo:0.30, kick:0.0 },
+  listening: { ring:[126,240,255], core:[215,250,255], bright:0.75, tempo:0.55, kick:0.5 },
+  thinking:  { ring:[255,181, 71], core:[255,228,168], bright:1.00, tempo:1.70, kick:2.4 },
+  speaking:  { ring:[ 76,255,168], core:[232,255,240], bright:1.28, tempo:0.80, kick:1.2 },
+  alert:     { ring:[255, 84,112], core:[255,196,205], bright:1.20, tempo:2.10, kick:3.2 },
+};
+let mode = 'idle';
+const cur = { ring:[58,118,138], core:[110,190,215], bright:0.32, tempo:0.30 };
+const lerp = (a,b,t)=> a+(b-a)*t;
+const rgba = (c,a)=> `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${Math.max(0,a)})`;
+
+function easeState(){
+  const T = STATES[mode], k = 0.055;
+  for(let i=0;i<3;i++){
+    cur.ring[i] = lerp(cur.ring[i], T.ring[i], k);
+    cur.core[i] = lerp(cur.core[i], T.core[i], k);
+  }
+  cur.bright = lerp(cur.bright, T.bright, k);
+  cur.tempo  = lerp(cur.tempo,  T.tempo,  k*0.7);
+  document.documentElement.style.setProperty('--state', rgba(cur.ring,1));
+}
+
+/* ===================== CANVAS ===================== */
+const cv = document.getElementById('reactor');
+const ctx = cv.getContext('2d');
+let W=0,H=0,CX=0,CY=0,R=0;
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+  const r = cv.getBoundingClientRect();
+  cv.width=r.width*dpr; cv.height=r.height*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  W=r.width; H=r.height; CX=W/2; CY=H/2;
+  R = Math.min(W,H)*0.42;
+}
+new ResizeObserver(resize).observe(cv);
+resize();
+
+/* ===================== RINGS ===================== */
+const RINGS = [
+  { r:1.00, w:1,   drift:  0.030, dim:.30, arcs:[[0,52],[70,26],[104,80],[196,18],[222,120]] },
+  { r:0.93, w:1,   drift: -0.055, dim:.18, arcs:[[10,150],[180,40],[240,95]] },
+  { r:0.84, w:2,   drift:  0.020, dim:.50, arcs:[[300,110],[60,30],[130,52]] },
+  { r:0.77, w:1,   drift: -0.090, dim:.20, arcs:Array.from({length:9},(_,i)=>[i*40,20]) },
+];
+RINGS.forEach(g=>{ g.phase = Math.random()*360; g.vel = g.drift; });
+function stepRings(){
+  for(const g of RINGS){
+    g.vel += (g.drift*cur.tempo - g.vel) * 0.035;
+    g.phase += g.vel;
+  }
+}
+function kick(){
+  const f = STATES[mode].kick;
+  for(const g of RINGS) g.vel += g.drift * f * (6 + Math.random()*6);
+}
+function drawRings(){
+  for(const g of RINGS){
+    const rad = R*g.r;
+    ctx.lineWidth = g.w;
+    ctx.strokeStyle = rgba(cur.ring, g.dim*cur.bright);
+    ctx.shadowColor = rgba(cur.ring,.6); ctx.shadowBlur = 6;
+    for(const [s,sw] of g.arcs){
+      const a0=(s+g.phase)*Math.PI/180;
+      ctx.beginPath(); ctx.arc(CX,CY,rad,a0,a0+sw*Math.PI/180); ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+  }
+}
+function drawTicks(t){
+  const rad = R*0.90;
+  for(let i=0;i<72;i++){
+    const long = i%6===0;
+    const a = (i*5 + t*0.05*cur.tempo)*Math.PI/180;
+    const len = long?12:5;
+    ctx.beginPath();
+    ctx.strokeStyle = rgba(cur.ring,(long?.42:.16)*cur.bright);
+    ctx.lineWidth = 1;
+    ctx.moveTo(CX+Math.cos(a)*rad, CY+Math.sin(a)*rad);
+    ctx.lineTo(CX+Math.cos(a)*(rad+len), CY+Math.sin(a)*(rad+len));
+    ctx.stroke();
+  }
+}
+let sweep=0, sweepAlpha=0;
+function drawSweep(){
+  sweepAlpha = lerp(sweepAlpha, mode==='thinking'?1:0, 0.06);
+  if(sweepAlpha<.01) return;
+  sweep += 1.4;
+  const a = sweep*Math.PI/180;
+  const g = ctx.createLinearGradient(CX,CY, CX+Math.cos(a)*R, CY+Math.sin(a)*R);
+  g.addColorStop(0, rgba(cur.ring,0));
+  g.addColorStop(1, rgba(cur.ring,.45*sweepAlpha));
+  ctx.strokeStyle=g; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(CX,CY);
+  ctx.lineTo(CX+Math.cos(a)*R*1.02, CY+Math.sin(a)*R*1.02); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(CX,CY); ctx.arc(CX,CY,R*1.02,a-0.5,a); ctx.closePath();
+  ctx.fillStyle = rgba(cur.ring,.05*sweepAlpha); ctx.fill();
+}
+
+/* ===================== CORE ===================== */
+const CORE_SCALE = 0.47;
+function verts(rad, rot=0){
+  const v=[];
+  for(let i=0;i<3;i++){
+    const a=(90 + i*120 + rot)*Math.PI/180;
+    v.push([Math.cos(a)*rad, Math.sin(a)*rad]);
+  }
+  return v;
+}
+function chamferPts(rad, ch, rot=0){
+  const v=verts(rad,rot), p=[];
+  for(let i=0;i<3;i++){
+    const c=v[i], pr=v[(i+2)%3], nx=v[(i+1)%3];
+    p.push([ c[0]+(pr[0]-c[0])*ch, c[1]+(pr[1]-c[1])*ch ]);
+    p.push([ c[0]+(nx[0]-c[0])*ch, c[1]+(nx[1]-c[1])*ch ]);
+  }
+  return p;
+}
+function trace(p){
+  ctx.beginPath();
+  ctx.moveTo(p[0][0],p[0][1]);
+  for(let i=1;i<p.length;i++) ctx.lineTo(p[i][0],p[i][1]);
+  ctx.closePath();
+}
+function plate(rad,ch,w,alpha,rot,B){
+  trace(chamferPts(rad,ch,rot));
+  ctx.lineWidth=w;
+  ctx.strokeStyle=rgba(cur.ring, alpha*B);
+  ctx.shadowColor=rgba(cur.ring,.8); ctx.shadowBlur=9*B;
+  ctx.stroke(); ctx.shadowBlur=0;
+}
+function rails(rad,count,w,alpha,B,rot=0){
+  const v=verts(rad,rot);
+  ctx.lineWidth=w;
+  ctx.strokeStyle=rgba(cur.ring, alpha*B);
+  ctx.lineCap='butt';
+  for(let e=0;e<3;e++){
+    const a=v[e], b=v[(e+1)%3];
+    for(let i=0;i<count;i++){
+      const t0=0.14+(i/count)*0.72+0.012;
+      const t1=0.14+((i+1)/count)*0.72-0.012;
+      ctx.beginPath();
+      ctx.moveTo(a[0]+(b[0]-a[0])*t0, a[1]+(b[1]-a[1])*t0);
+      ctx.lineTo(a[0]+(b[0]-a[0])*t1, a[1]+(b[1]-a[1])*t1);
+      ctx.stroke();
+    }
+  }
+}
+function chevron(rad,w,alpha,B){
+  const v=verts(rad);
+  ctx.beginPath();
+  ctx.moveTo(v[1][0],v[1][1]);
+  ctx.lineTo(v[0][0],v[0][1]);
+  ctx.lineTo(v[2][0],v[2][1]);
+  ctx.lineWidth=w; ctx.lineJoin='miter';
+  ctx.strokeStyle=rgba(cur.core, alpha*B);
+  ctx.shadowColor=rgba(cur.core,.9); ctx.shadowBlur=14*B;
+  ctx.stroke(); ctx.shadowBlur=0;
+}
+function hexNode(x,y,r,alpha,B){
+  ctx.beginPath();
+  for(let k=0;k<6;k++){
+    const a=k*60*Math.PI/180;
+    const hx=x+Math.cos(a)*r, hy=y+Math.sin(a)*r;
+    k?ctx.lineTo(hx,hy):ctx.moveTo(hx,hy);
+  }
+  ctx.closePath();
+  ctx.fillStyle=rgba(cur.core, alpha*B);
+  ctx.shadowColor=rgba(cur.core,.95); ctx.shadowBlur=13*B;
+  ctx.fill(); ctx.shadowBlur=0;
+  ctx.lineWidth=1;
+  ctx.strokeStyle=rgba(cur.core, Math.min(1,alpha*B*1.4));
+  ctx.stroke();
+}
+let detailRot=0;
+function drawCore(t){
+  const pulse=1 + level*0.09 + Math.sin(t*0.018)*0.012;
+  const flick=0.95 + Math.random()*0.05;
+  const S=R*CORE_SCALE*pulse, B=cur.bright*flick;
+  detailRot += 0.06*cur.tempo;
+
+  ctx.save(); ctx.translate(CX,CY); ctx.lineJoin='round';
+
+  let g=ctx.createRadialGradient(0,0,0, 0,0, S*2.1);
+  g.addColorStop(0, rgba(cur.core,.26*B + level*.22));
+  g.addColorStop(.42, rgba(cur.ring,.09*B));
+  g.addColorStop(1, rgba(cur.ring,0));
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,S*2.1,0,Math.PI*2); ctx.fill();
+
+  plate(S*1.00,0.20,3.0,0.95,0,B);
+  plate(S*0.955,0.20,1.0,0.30,0,B);
+  rails(S*0.90,7,2.5,0.55,B);
+  plate(S*0.82,0.22,1.5,0.45,0,B);
+  plate(S*0.76,0.24,3.0,0.90,0,B);
+  rails(S*0.68,4,1.5,0.35,B,180);
+  plate(S*0.62,0.26,1.0,0.35,180,B);
+  plate(S*0.55,0.24,2.0,0.70,detailRot*0.15,B);
+
+  chevron(S*0.52,4.0,0.60,B);
+  chevron(S*0.42,3.0,0.75,B);
+  chevron(S*0.33,2.0,0.90,B);
+
+  const vOuter=verts(S*0.88);
+  vOuter.forEach(([x,y])=> hexNode(x,y,S*0.055,.55,B));
+  for(let e=0;e<3;e++){
+    const a=vOuter[e], b=vOuter[(e+1)%3];
+    hexNode((a[0]+b[0])/2,(a[1]+b[1])/2,S*0.032,.40,B);
+  }
+
+  const vt=verts(S*0.97);
+  ctx.lineWidth=1;
+  ctx.strokeStyle=rgba(cur.ring,.30*B);
+  for(let e=0;e<3;e++){
+    const a=vt[e], b=vt[(e+1)%3];
+    const nx=-(b[1]-a[1]), ny=(b[0]-a[0]), nl=Math.hypot(nx,ny);
+    for(let i=0;i<=12;i++){
+      const tt=0.16+(i/12)*0.68;
+      const px=a[0]+(b[0]-a[0])*tt, py=a[1]+(b[1]-a[1])*tt;
+      const len=(i%3===0)?S*0.05:S*0.025;
+      ctx.beginPath();
+      ctx.moveTo(px,py);
+      ctx.lineTo(px-nx/nl*len, py-ny/nl*len);
+      ctx.stroke();
+    }
+  }
+
+  const inner=chamferPts(S*0.26,0.30,0);
+  trace(inner);
+  g=ctx.createRadialGradient(0,-S*0.06,0, 0,0, S*0.32);
+  g.addColorStop(0, rgba(cur.core,.95*B + level*.05));
+  g.addColorStop(.6, rgba(cur.core,.45*B));
+  g.addColorStop(1, rgba(cur.ring,.18*B));
+  ctx.fillStyle=g; ctx.fill();
+  ctx.lineWidth=1.4;
+  ctx.strokeStyle=rgba(cur.core, Math.min(1,.95*B));
+  ctx.shadowColor=rgba(cur.core,1); ctx.shadowBlur=22*B + level*26;
+  ctx.stroke(); ctx.shadowBlur=0;
+
+  g=ctx.createRadialGradient(0,0,0, 0,0, S*0.14*(1+level*0.5));
+  g.addColorStop(0, `rgba(255,255,255,${Math.min(1,.55*B + level*.45)})`);
+  g.addColorStop(1, rgba(cur.core,0));
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(0,0,S*0.14*(1+level*0.5),0,Math.PI*2); ctx.fill();
+
+  ctx.restore();
+}
+
+/* ===================== WAVEFORM ===================== */
+const BINS=96;
+const bins=new Float32Array(BINS);
+let level=0, target=0;
+function drawWave(t){
+  const base=R*0.70;
+  ctx.beginPath();
+  for(let i=0;i<=BINS;i++){
+    const k=i%BINS, a=(k/BINS)*Math.PI*2;
+    const idle=Math.sin(a*3+t*.012)*1.8 + Math.sin(a*7-t*.008)*1.2;
+    const amp=base + idle + bins[k]*level*R*0.18;
+    const x=CX+Math.cos(a)*amp, y=CY+Math.sin(a)*amp;
+    i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+  }
+  ctx.closePath();
+  ctx.strokeStyle=rgba(cur.ring,(.45+level*.45)*cur.bright);
+  ctx.lineWidth=1.5;
+  ctx.shadowColor=rgba(cur.ring,.8); ctx.shadowBlur=12+level*24;
+  ctx.stroke(); ctx.shadowBlur=0;
+}
+function drawCrosshair(){
+  const gap=R*1.12;
+  ctx.strokeStyle=rgba(cur.ring,.10*cur.bright);
+  ctx.lineWidth=1;
+  [[0,-1],[0,1],[-1,0],[1,0]].forEach(([dx,dy])=>{
+    ctx.beginPath();
+    ctx.moveTo(CX+dx*gap, CY+dy*gap);
+    ctx.lineTo(CX+dx*Math.max(W,H), CY+dy*Math.max(W,H));
+    ctx.stroke();
+  });
+}
+
+/* ===================== FPS =====================
+   measured right here in the render loop — no Python involved.
+   NOTE: this is the HUD's own frame rate, not your game's. There is
+   no way to read another app's FPS from inside this process; that
+   needs RTSS/PresentMon-level hooks. This number tells you whether
+   the HUD itself is dropping frames, which is what you actually
+   want to know when you're tuning the reactor.                  */
+let frames=0, lastFpsT=performance.now(), fps=0;
+function tickFps(){
+  frames++;
+  const now = performance.now();
+  if(now - lastFpsT >= 500){
+    fps = Math.round(frames*1000/(now-lastFpsT));
+    frames = 0; lastFpsT = now;
+    const el = document.getElementById('fps');
+    el.textContent = fps;
+    el.className = fps < 30 ? 'low' : '';
+  }
+}
+
+let t=0;
+function frame(){
+  ctx.clearRect(0,0,W,H);
+  easeState();
+  level += (target-level)*0.14;
+  stepRings();
+  t++;
+  drawCrosshair();
+  drawRings();
+  drawTicks(t);
+  drawSweep();
+  drawWave(t);
+  drawCore(t);
+  tickFps();
+  requestAnimationFrame(frame);
+}
+frame();
+
+/* ===================== NETWORK SPARKLINE ===================== */
+const spark = document.getElementById('net-spark');
+const sctx  = spark.getContext('2d');
+const HIST = 72;
+const histDown = new Array(HIST).fill(0);
+const histUp   = new Array(HIST).fill(0);
+
+function fmtRate(bps){
+  if(bps == null) return '—';
+  if(bps < 1024)          return `${bps.toFixed(0)} B/s`;
+  if(bps < 1024*1024)     return `${(bps/1024).toFixed(1)} KB/s`;
+  return `${(bps/1048576).toFixed(2)} MB/s`;
+}
+function sparkResize(){
+  const dpr = window.devicePixelRatio || 1;
+  const r = spark.getBoundingClientRect();
+  spark.width = r.width*dpr; spark.height = r.height*dpr;
+  sctx.setTransform(dpr,0,0,dpr,0,0);
+}
+new ResizeObserver(sparkResize).observe(spark);
+sparkResize();
+
+function drawSpark(){
+  const r = spark.getBoundingClientRect();
+  const w = r.width, h = r.height;
+  sctx.clearRect(0,0,w,h);
+  // autoscale to the rolling peak, floor at 64KB/s so idle isn't noisy
+  const peak = Math.max(65536, ...histDown, ...histUp);
+  const line = (hist, color, alpha) => {
+    sctx.beginPath();
+    hist.forEach((v,i)=>{
+      const x = (i/(HIST-1))*w;
+      const y = h - (v/peak)*h*0.92 - 1;
+      i ? sctx.lineTo(x,y) : sctx.moveTo(x,y);
+    });
+    sctx.strokeStyle = color;
+    sctx.globalAlpha = alpha;
+    sctx.lineWidth = 1.4;
+    sctx.shadowColor = color; sctx.shadowBlur = 6;
+    sctx.stroke();
+    sctx.shadowBlur = 0;
+    sctx.globalAlpha = 1;
+  };
+  // baseline
+  sctx.strokeStyle = 'rgba(14,42,51,1)';
+  sctx.lineWidth = 1;
+  sctx.beginPath(); sctx.moveTo(0,h-1); sctx.lineTo(w,h-1); sctx.stroke();
+  line(histUp,   '#8fe3b4', .75);
+  line(histDown, '#7ef0ff', .95);
+}
+
+/* ===================== PUBLIC API ===================== */
+function setState(s){
+  if(!STATES[s] || s===mode) return;
+  mode = s; kick();
+  document.getElementById('state-text').textContent =
+    ({idle:'STANDBY', listening:'LISTENING', thinking:'PROCESSING',
+      speaking:'RESPONDING', alert:'ATTENTION'})[s];
+}
+function setLevel(v){
+  target = Math.max(0, Math.min(1, v));
+  for(let i=0;i<BINS;i++) bins[i] += ((Math.random()*1.6-.3)-bins[i])*0.35;
+}
+function log(who, text){
+  const box=document.getElementById('log');
+  const line=document.createElement('div');
+  line.className='line '+who;
+  const label={you:'YOU', jarvis:'J.A.R.V.I.S', sys:'SYSTEM', alert:'ALERT'}[who]||who;
+  line.innerHTML=`<span class="who">${label}</span><span class="txt"></span>`;
+  line.querySelector('.txt').textContent=text;
+  box.appendChild(line);
+  box.scrollTop=box.scrollHeight;
+  while(box.children.length>60) box.removeChild(box.firstChild);
+}
+
+/* telemetry({
+     cpu, mem, gpu,            // percent  0-100
+     cputemp, gputemp,         // celsius, or null if unreadable
+     net_down, net_up,         // BYTES per second, or null
+     procs, uptime
+   })
+   Any key you omit is left untouched. null renders as a dim N/A —
+   important, because CPU temp genuinely is unavailable on a lot of
+   Windows boxes and you want the HUD to say so, not to show a zero. */
+function setStat(key, value, unit, max, warnAt){
+  const el = document.querySelector(`.stat[data-stat="${key}"]`);
+  if(!el) return;
+  const v = el.querySelector('.v');
+  const bar = el.querySelector('.bar');
+  if(!bar.children.length)
+    for(let i=0;i<20;i++) bar.appendChild(document.createElement('i'));
+
+  if(value == null){
+    v.textContent = 'N/A';
+    v.className = 'v na';
+    [...bar.children].forEach(s=> s.className='');
+    return;
+  }
+  v.textContent = `${Math.round(value)}${unit}`;
+  v.className = 'v' + (value >= warnAt ? ' warn' : '');
+  const filled = Math.round(Math.min(value, max)/max * 20);
+  [...bar.children].forEach((s,i)=>{
+    s.className = i < filled ? (value >= warnAt ? 'hot' : 'on') : '';
+  });
+}
+
+function telemetry(d){
+  if('cpu'     in d) setStat('cpu',     d.cpu,     '%',   100, 90);
+  if('mem'     in d) setStat('mem',     d.mem,     '%',   100, 90);
+  if('gpu'     in d) setStat('gpu',     d.gpu,     '%',   100, 90);
+  if('cputemp' in d) setStat('cputemp', d.cputemp, '°C',  100, 85);
+  if('gputemp' in d) setStat('gputemp', d.gputemp, '°C',  100, 83);
+
+  if('net_down' in d || 'net_up' in d){
+    const dn = d.net_down ?? 0, up = d.net_up ?? 0;
+    document.getElementById('net-down').textContent = fmtRate(d.net_down);
+    document.getElementById('net-up').textContent   = fmtRate(d.net_up);
+    histDown.push(dn); histDown.shift();
+    histUp.push(up);   histUp.shift();
+    drawSpark();
+  }
+  if(d.procs  != null) document.getElementById('procs').textContent  = d.procs;
+  if(d.uptime != null) document.getElementById('uptime').textContent = d.uptime;
+}
+
+document.getElementById('cmd').addEventListener('keydown', e=>{
+  if(e.key!=='Enter' || !e.target.value.trim()) return;
+  log('you', e.target.value.trim());
+  console.log('SEND ->', e.target.value.trim());
+  e.target.value='';
+});
+document.getElementById('interrupt').addEventListener('click', ()=>{ console.log('INTERRUPT'); setState('listening'); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ console.log('INTERRUPT'); setState('listening'); } });
+setInterval(()=>{
+  const n=new Date();
+  document.getElementById('clock-time').textContent=n.toTimeString().slice(0,8);
+  document.getElementById('clock-date').textContent=n.toDateString().toUpperCase();
+},1000);
+
+/* ===================== DEMO DRIVER — delete when Python drives ===================== */
+setInterval(()=>{
+  let v;
+  if(mode==='speaking')       v=.55+Math.random()*.45;
+  else if(mode==='listening') v=.06+Math.random()*.14;
+  else if(mode==='thinking')  v=.18+Math.sin(Date.now()/170)*.12;
+  else if(mode==='alert')     v=.40+Math.random()*.25;
+  else                        v=.02;
+  setLevel(v);
+},33);
+
+let fakeNet = 0;
+setInterval(()=>{
+  fakeNet = Math.max(0, fakeNet + (Math.random()-0.45)*400000);
+  telemetry({
+    cpu: 12+Math.round(Math.random()*22),
+    mem: 68+Math.round(Math.random()*10),
+    gpu:  8+Math.round(Math.random()*15),
+    cputemp: 52+Math.round(Math.random()*14),
+    gputemp: 44+Math.round(Math.random()*10),
+    net_down: fakeNet + Math.random()*90000,
+    net_up:   fakeNet*0.18 + Math.random()*24000,
+    procs: 270+Math.round(Math.random()*12),
+    uptime: '01:04'
+  });
+},1000);
+
+document.querySelectorAll('.demo button').forEach(b=> b.onclick=()=> setState(b.dataset.demo));
+
+const script=[
+  [ 800, ()=> log('sys','Core online. Audio stream open.')],
+  [2000, ()=> setState('listening')],
+  [3800, ()=> { log('you','Jarvis, pull up the diagnostics.'); setState('thinking'); }],
+  [6200, ()=> { setState('speaking'); log('jarvis','All systems nominal, sir.'); }],
+  [8600, ()=> setState('listening')],
+  [11000,()=> { setState('alert'); log('alert','CPU core at 92°C — thermal throttling likely.'); }],
+  [14500,()=> setState('listening')],
+];
+script.forEach(([ms,fn])=> setTimeout(fn,ms));
+</script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+sounddevice
+google-genai
+google-generativeai
+pillow
+requests
+beautifulsoup4
+duckduckgo-search
+playwright
+pyautogui
+pyperclip
+pygetwindow
+opencv-python
+numpy
+mss
+psutil
+send2trash
+youtube-transcript-api
+python-pptx
+fastapi
+uvicorn[standard]
+cryptography
+python-multipart
+comtypes; sys_platform == "win32"
+pycaw; sys_platform == "win32"
+win10toast; sys_platform == "win32"
+pywinauto; sys_platform == "win32"
+qrcode[pil]
+
+# ── JARVIS fork additions (pinned) ───────────────────────────────────────────
+# PyQt6 was missing from upstream requirements though ui.py depends on it.
+PyQt6==6.11.0
+PyQt6-WebEngine==6.11.0          # web HUD host (QWebEngineView)
+nvidia-ml-py==13.610.43          # GPU load/temp via NVML (NVIDIA only, optional)
+wmi==1.5.1; sys_platform == "win32"   # CPU temp via LibreHardwareMonitor (optional)
+pyinstaller==6.21.0              # packaging (--onedir)
+openwakeword==0.6.0              # on-device "Hey Jarvis" wake word (no key/signup)
+onnxruntime==1.27.0              # openWakeWord inference backend
